@@ -12,3 +12,4 @@ aiohttp
 openai
 python-dotenv
 psutil
+uvloop

@@ -13,8 +13,8 @@ from utils import get_settings, save_group_settings
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
-client = AsyncIOMotorClient(DATABASE_URI)
+# Initialize MongoDB client with connection pooling
+client = AsyncIOMotorClient(DATABASE_URI, maxPoolSize=50, minPoolSize=10)
 db = client[DATABASE_NAME]
 instance = Instance.from_db(db)
 
@@ -29,17 +29,16 @@ class Media(Document):
     caption = fields.StrField(allow_none=True)
 
     class Meta:
-        indexes = ('$file_name', )
+        indexes = [('$file_name', 'text'), ('$caption', 'text')] if USE_CAPTION_FILTER else [('$file_name', 'text')]
         collection_name = COLLECTION_NAME
-
 
 async def save_file(media):
     """Save file in database"""
-
-    # TODO: Find better way to get same file_id for same media to avoid duplicates
-    file_id, file_ref = unpack_new_file_id(media.file_id)
-    file_name = re.sub(r"(_|\-|\.|\+)", " ", str(media.file_name))
     try:
+        file_id, file_ref = unpack_new_file_id(media.file_id)
+        # Normalize file_name only once
+        file_name = re.sub(r"[-_\.+]+", " ", str(media.file_name)).strip()
+        
         file = Media(
             file_id=file_id,
             file_ref=file_ref,
@@ -49,130 +48,118 @@ async def save_file(media):
             mime_type=media.mime_type,
             caption=media.caption.html if media.caption else None,
         )
-    except ValidationError:
-        logger.exception('Error occurred while saving file in database')
+        await file.commit()
+        logger.info(f'{getattr(media, "file_name", "NO_FILE")} saved to database')
+        return True, 1
+    except ValidationError as e:
+        logger.exception(f'Validation error while saving file: {e}')
         return False, 2
-    else:
-        try:
-            await file.commit()
-        except DuplicateKeyError:      
-            logger.warning(
-                f'{getattr(media, "file_name", "NO_FILE")} is already saved in database'
-            )
-
-            return False, 0
-        else:
-            logger.info(f'{getattr(media, "file_name", "NO_FILE")} is saved to database')
-            return True, 1
-
-
+    except DuplicateKeyError:
+        logger.warning(f'{getattr(media, "file_name", "NO_FILE")} already exists in database')
+        return False, 0
 
 async def get_search_results(chat_id, query, file_type=None, max_results=10, offset=0, filter=False):
-    """For given query return (results, next_offset)"""
+    """For given query return (results, next_offset, total_results)"""
+    # Cache settings to avoid multiple DB calls
+    settings = None
     if chat_id is not None:
         settings = await get_settings(int(chat_id))
         try:
-            if settings['max_btn']:
-                max_results = 10
-            else:
-                max_results = int(MAX_B_TN)
+            max_results = 10 if settings['max_btn'] else int(MAX_B_TN)
         except KeyError:
             await save_group_settings(int(chat_id), 'max_btn', False)
-            settings = await get_settings(int(chat_id))
-            if settings['max_btn']:
-                max_results = 10
-            else:
-                max_results = int(MAX_B_TN)
-    query = re.sub(r"[-:\"';!]", " ", query)
-    query = re.sub(r"\s+", " ", query).strip()
-    #if filter:
-        #better ?
-        #query = query.replace(' ', r'(\s|\.|\+|\-|_)')
-        #raw_pattern = r'(\s|_|\-|\.|\+)' + query + r'(\s|_|\-|\.|\+)'
+            max_results = 10 if (await get_settings(int(chat_id)))['max_btn'] else int(MAX_B_TN)
+
+    # Optimize query normalization
+    query = query.strip()
     if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
+        raw_pattern = '.*'
     else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
-    
+        # Precompile regex for reuse
+        query = re.sub(r'[-:"\';!\s]+', ' ', query).strip()
+        raw_pattern = fr'\b{re.escape(query)}\b' if ' ' not in query else query.replace(' ', r'.*[\s]')
+
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        return []
+    except re.error:
+        logger.error(f"Invalid regex pattern: {raw_pattern}")
+        return [], '', 0
 
+    # Build filter with text index support
+    mongo_filter = {}
     if USE_CAPTION_FILTER:
-        filter = {'$or': [{'file_name': regex}, {'caption': regex}]}
+        mongo_filter['$text'] = {'$search': query}
     else:
-        filter = {'file_name': regex}
+        mongo_filter['file_name'] = {'$regex': regex, '$options': 'i'}
 
     if file_type:
-        filter['file_type'] = file_type
+        mongo_filter['file_type'] = file_type
 
-    total_results = await Media.count_documents(filter)
-    next_offset = offset + max_results
+    try:
+        # Use aggregation for efficient counting and fetching
+        pipeline = [
+            {'$match': mongo_filter},
+            {'$sort': {'$natural': -1}},
+            {'$facet': {
+                'results': [{'$skip': offset}, {'$limit': max_results}],
+                'total': [{'$count': 'count'}]
+            }}
+        ]
+        cursor = await Media.aggregate(pipeline).next()
+        files = cursor['results']
+        total_results = cursor['total'][0]['count'] if cursor['total'] else 0
+        next_offset = offset + max_results if offset + max_results < total_results else ''
 
-    if next_offset > total_results:
-        next_offset = ''
-
-    cursor = Media.find(filter)
-    # Sort by recent
-    cursor.sort('$natural', -1)
-    # Slice files according to offset and max results
-    cursor.skip(offset).limit(max_results)
-    # Get list of files
-    files = await cursor.to_list(length=max_results)
-
-    return files, next_offset, total_results
+        return files, next_offset, total_results
+    except Exception as e:
+        logger.error(f"Error in search: {e}")
+        return [], '', 0
 
 async def get_bad_files(query, file_type=None, filter=False):
-    """For given query return (results, next_offset)"""
+    """For given query return (results, total_results)"""
     query = query.strip()
-    #if filter:
-        #better ?
-        #query = query.replace(' ', r'(\s|\.|\+|\-|_)')
-        #raw_pattern = r'(\s|_|\-|\.|\+)' + query + r'(\s|_|\-|\.|\+)'
     if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
+        raw_pattern = '.*'
     else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
-    
+        query = re.sub(r'[-:"\';!\s]+', ' ', query).strip()
+        raw_pattern = fr'\b{re.escape(query)}\b' if ' ' not in query else query.replace(' ', r'.*[\s]')
+
     try:
         regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        return []
+    except re.error:
+        logger.error(f"Invalid regex pattern: {raw_pattern}")
+        return [], 0
 
+    mongo_filter = {}
     if USE_CAPTION_FILTER:
-        filter = {'$or': [{'file_name': regex}, {'caption': regex}]}
+        mongo_filter['$text'] = {'$search': query}
     else:
-        filter = {'file_name': regex}
+        mongo_filter['file_name'] = {'$regex': regex, '$options': 'i'}
 
     if file_type:
-        filter['file_type'] = file_type
+        mongo_filter['file_type'] = file_type
 
-    total_results = await Media.count_documents(filter)
-
-    cursor = Media.find(filter)
-    # Sort by recent
-    cursor.sort('$natural', -1)
-    # Get list of files
-    files = await cursor.to_list(length=total_results)
-
-    return files, total_results
+    try:
+        total_results = await Media.count_documents(mongo_filter)
+        cursor = Media.find(mongo_filter).sort('$natural', -1)
+        files = await cursor.to_list(length=total_results)
+        return files, total_results
+    except Exception as e:
+        logger.error(f"Error in get_bad_files: {e}")
+        return [], 0
 
 async def get_file_details(query):
-    filter = {'file_id': query}
-    cursor = Media.find(filter)
-    filedetails = await cursor.to_list(length=1)
-    return filedetails
-
+    """Return file details for a given file_id"""
+    try:
+        filedetails = await Media.find_one({'file_id': query})
+        return [filedetails] if filedetails else []
+    except Exception as e:
+        logger.error(f"Error fetching file details: {e}")
+        return []
 
 def encode_file_id(s: bytes) -> str:
     r = b""
     n = 0
-
     for i in s + bytes([22]) + bytes([4]):
         if i == 0:
             n += 1
@@ -180,15 +167,11 @@ def encode_file_id(s: bytes) -> str:
             if n:
                 r += b"\x00" + bytes([n])
                 n = 0
-
             r += bytes([i])
-
     return base64.urlsafe_b64encode(r).decode().rstrip("=")
-
 
 def encode_file_ref(file_ref: bytes) -> str:
     return base64.urlsafe_b64encode(file_ref).decode().rstrip("=")
-
 
 def unpack_new_file_id(new_file_id):
     """Return file_id, file_ref"""

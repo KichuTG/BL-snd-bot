@@ -11,3 +11,5 @@ datetime
 pytz
 aiohttp
 openai
+python-dotenv
+psutil

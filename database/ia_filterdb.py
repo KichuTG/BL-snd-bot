@@ -29,8 +29,10 @@ class Media(Document):
     caption = fields.StrField(allow_none=True)
 
     class Meta:
-        # Use a single compound text index for both fields when USE_CAPTION_FILTER is enabled
-        indexes = [({'file_name': 'text', 'caption': 'text'} if USE_CAPTION_FILTER else {'file_name': 'text'})]
+        # Use proper index format for umongo with compound text index
+        indexes = [
+            {'key': [('file_name', 'text'), ('caption', 'text')] if USE_CAPTION_FILTER else [('file_name', 'text')]}
+        ]
         collection_name = COLLECTION_NAME
 
 async def save_file(media):
